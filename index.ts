@@ -16,6 +16,7 @@ type CliOptions = {
   cwd: string;
   pathToClaudeCodeExecutable?: string;
   claudeArgs: string[];
+  turnTimeoutMs: number;
 };
 
 type JsonRecord = Record<string, unknown>;
@@ -76,7 +77,11 @@ type AssistantDiscovery = {
 
 const POLL_MS = 100;
 const START_TIMEOUT_MS = 20_000;
-const TURN_TIMEOUT_MS = 180_000;
+// Default upper bound on a single user→assistant exchange. For agentic
+// runs that chain many tool-use turns before the model finally emits
+// end_turn, the whole chain counts as one "turn" from Shannon's view, so
+// the default needs to be generous. Override via `--turn-timeout-ms`.
+const DEFAULT_TURN_TIMEOUT_MS = 10 * 60_000;
 const TURN_DURATION_GRACE_MS = 1_000;
 const WEB_SEARCH_COST_USD = 0.01;
 
@@ -194,6 +199,10 @@ export function parseArgs(argv: string[], cwd = process.cwd()): CliOptions {
     .option("--system-prompt <prompt>", "system prompt")
     .option("--tools <tools...>", "available tools")
     .option("--tmux [mode]", "create a tmux session for the worktree")
+    .option(
+      "--turn-timeout-ms <ms>",
+      "max milliseconds to wait for a single user→assistant turn to complete (defaults to 10 minutes, large enough for most agentic tool-use chains)",
+    )
     .option("-w, --worktree [name]", "create a new git worktree for this session")
     .configureOutput({
       writeOut: () => undefined,
@@ -230,6 +239,16 @@ export function parseArgs(argv: string[], cwd = process.cwd()): CliOptions {
     throw new Error(`Unsupported --output-format ${outputFormat || "<missing>"}`);
   }
 
+  let turnTimeoutMs = DEFAULT_TURN_TIMEOUT_MS;
+  if (parsed.turnTimeoutMs !== undefined) {
+    const raw = typeof parsed.turnTimeoutMs === "string" ? parsed.turnTimeoutMs : String(parsed.turnTimeoutMs);
+    const n = Number.parseInt(raw, 10);
+    if (!Number.isFinite(n) || n <= 0) {
+      throw new Error(`--turn-timeout-ms must be a positive integer, got ${raw}`);
+    }
+    turnTimeoutMs = n;
+  }
+
   return {
     prompt: prompt || undefined,
     inputFormat,
@@ -242,6 +261,7 @@ export function parseArgs(argv: string[], cwd = process.cwd()): CliOptions {
       ? parsed.pathToClaudeCodeExecutable
       : undefined,
     claudeArgs: buildClaudeArgs(parsed),
+    turnTimeoutMs,
   };
 }
 
@@ -678,38 +698,72 @@ export function promptFromUserMessage(message: JsonRecord): string | undefined {
 }
 
 export function assistantReplyFromRows(prompt: string, rows: TranscriptRow[]): TranscriptRow | undefined {
+  // For agentic flows (Claude Code with tool use), a single user prompt can
+  // produce many assistant turns: text, tool_use, tool_use, tool_use, ...,
+  // final text with stop_reason=end_turn. We want the LAST assistant message
+  // after the prompt — and only if its stop_reason indicates the agent has
+  // truly stopped (not "tool_use", which means more turns are coming).
   let sawPrompt = false;
+  let lastTerminalReply: TranscriptRow | undefined;
+  let lastReplyAny: TranscriptRow | undefined;
 
   for (const row of rows) {
     if (row.type === "user" && row.message?.content === prompt) {
       sawPrompt = true;
+      lastTerminalReply = undefined;
+      lastReplyAny = undefined;
       continue;
     }
 
     if (!sawPrompt || row.type !== "assistant" || row.message?.role !== "assistant") continue;
-    if (textFromContent(row.message.content)) return row;
+    if (!textFromContent(row.message.content)) continue;
+    lastReplyAny = row;
+    const stopReason = (row.message as JsonRecord).stop_reason;
+    if (stopReason && stopReason !== "tool_use") {
+      lastTerminalReply = row;
+    }
   }
+
+  // Prefer a terminal reply (agent fully stopped). If none yet, return
+  // undefined so the caller keeps polling. Only fall back to any reply when
+  // we have no stop_reason at all — i.e., legacy transcripts.
+  if (lastTerminalReply) return lastTerminalReply;
+  if (lastReplyAny && !(lastReplyAny.message as JsonRecord)?.stop_reason) return lastReplyAny;
+  return undefined;
 }
 
 export function turnDurationMsFromRows(prompt: string, rows: TranscriptRow[]): number | undefined {
+  // For agentic flows, wait until we see a turn_duration AFTER an assistant
+  // message whose stop_reason is terminal (not tool_use). Earlier
+  // turn_durations belong to intermediate tool-use turns and are not the
+  // session's final timing.
   let sawPrompt = false;
-  let sawAssistantReply = false;
+  let sawTerminalReply = false;
 
   for (const row of rows) {
     if (row.type === "user" && row.message?.content === prompt) {
       sawPrompt = true;
-      sawAssistantReply = false;
+      sawTerminalReply = false;
       continue;
     }
 
     if (!sawPrompt) continue;
     if (row.type === "assistant" && row.message?.role === "assistant" && textFromContent(row.message.content)) {
-      sawAssistantReply = true;
+      const stopReason = (row.message as JsonRecord).stop_reason;
+      if (stopReason && stopReason !== "tool_use") {
+        sawTerminalReply = true;
+      } else if (!stopReason) {
+        // Legacy: no stop_reason at all → treat as terminal so callers
+        // don't hang forever on older transcript formats.
+        sawTerminalReply = true;
+      } else {
+        sawTerminalReply = false;
+      }
       continue;
     }
 
     if (
-      sawAssistantReply
+      sawTerminalReply
       && row.type === "system"
       && row.subtype === "turn_duration"
       && typeof row.durationMs === "number"
@@ -768,7 +822,10 @@ export async function runShannon(options: CliOptions) {
       throw new Error("Expected at least one user message on stdin for --input-format=stream-json");
     }
 
-    const firstPromptSentAt = Date.now();
+    // Launch claude inside tmux WITHOUT the prompt as a positional arg.
+    // Claude Code 2.1.x does not auto-execute a positional prompt when run
+    // interactively, so anything passed here is dropped on the floor.
+    // We always feed the prompt explicitly via paste-buffer below.
     await runCommand([
       "tmux",
       "new-session",
@@ -779,18 +836,14 @@ export async function runShannon(options: CliOptions) {
       options.cwd,
       runtime.claude,
       ...options.claudeArgs,
-      prompt,
     ]);
 
-    let launchedWithPrompt = true;
     while (prompt) {
       promptCount += 1;
 
-      const promptSentAt = launchedWithPrompt ? firstPromptSentAt : Date.now();
-      if (!launchedWithPrompt) {
-        await waitForPrompt(tmuxSession);
-        await sendPrompt(tmuxSession, prompt);
-      }
+      await waitForPrompt(tmuxSession);
+      const promptSentAt = Date.now();
+      await sendPrompt(tmuxSession, prompt);
 
       if (options.replayUserMessages && options.outputFormat === "stream-json") {
         emitJson(toUserReplay(prompt));
@@ -844,6 +897,17 @@ export async function runShannon(options: CliOptions) {
         prompt,
         startedAt,
         transcriptRowCount,
+        options.turnTimeoutMs,
+        (intermediateRow) => {
+          // Stream tool-use assistant turns as they arrive so callers see
+          // live progress during long agentic runs instead of waiting in
+          // silence until end_turn.
+          if (options.outputFormat === "stream-json") {
+            emitJson(toSdkAssistant(intermediateRow));
+          } else if (options.outputFormat === "json") {
+            jsonMessages.push(toSdkAssistant(intermediateRow));
+          }
+        },
       );
       transcriptRowCount = assistant.rows.length;
       const result = toSdkResult(assistant.row, startedAt, promptCount, assistant.durationMs);
@@ -859,7 +923,6 @@ export async function runShannon(options: CliOptions) {
         emitOutput(options.outputFormat, turnMessages);
       }
 
-      launchedWithPrompt = false;
       prompt = await nextPrompt(promptIterator);
     }
 
@@ -1039,9 +1102,21 @@ async function waitForPrompt(tmuxSession: string) {
 }
 
 async function sendPrompt(tmuxSession: string, prompt: string) {
-  await runCommand(["tmux", "set-buffer", "-b", `shannon-${tmuxSession}`, prompt]);
-  await runCommand(["tmux", "paste-buffer", "-b", `shannon-${tmuxSession}`, "-t", tmuxSession]);
-  await runCommand(["tmux", "send-keys", "-t", tmuxSession, "C-m"]);
+  // Use `send-keys -l` (literal mode) so each character is sent as if typed
+  // rather than via paste-buffer. With paste-buffer, Claude Code enters a
+  // paste-handling state and the subsequent Enter keystroke is debounced
+  // away — the prompt shows in the input but is never submitted. Literal
+  // keys mimic real typing, which Claude treats as ordinary input.
+  // The `--` separator prevents prompts starting with `--` from being parsed
+  // as tmux flags.
+  await runCommand(["tmux", "send-keys", "-t", tmuxSession, "-l", "--", prompt]);
+  // Claude Code's input handler debounces fast keystroke bursts; the longer
+  // the prompt, the longer it needs to settle before Enter is accepted as
+  // "submit" instead of "ignored mid-type". Scale the delay with prompt
+  // length, clamped to a sane range.
+  const settleMs = Math.min(2000, Math.max(150, prompt.length * 2));
+  await sleep(settleMs);
+  await runCommand(["tmux", "send-keys", "-t", tmuxSession, "Enter"]);
 }
 
 async function nextPrompt(iterator: AsyncIterator<string>): Promise<string | undefined> {
@@ -1057,14 +1132,41 @@ async function waitForAssistantReply(
   prompt: string,
   startedAt: number,
   afterRowCount: number,
+  turnTimeoutMs: number,
+  onIntermediateTurn?: (row: TranscriptRow) => void,
 ): Promise<AssistantDiscovery> {
   let pendingRow: TranscriptRow | undefined;
   let pendingRows: TranscriptRow[] | undefined;
   let pendingStartedAt = 0;
+  // Track which intermediate (tool_use) assistant turns we've already
+  // forwarded so callers don't see duplicates.
+  const emittedUuids = new Set<string>();
 
-  while (Date.now() - startedAt < TURN_TIMEOUT_MS) {
+  while (Date.now() - startedAt < turnTimeoutMs) {
     const rows = await readTranscript(transcriptPath);
     const newRows = rows.slice(afterRowCount);
+
+    // Forward intermediate (tool_use) assistant turns as they arrive so the
+    // caller can stream live progress instead of going silent for the whole
+    // agentic run.
+    if (onIntermediateTurn) {
+      let sawPrompt = false;
+      for (const r of newRows) {
+        if (r.type === "user" && r.message?.content === prompt) {
+          sawPrompt = true;
+          continue;
+        }
+        if (!sawPrompt) continue;
+        if (r.type !== "assistant" || r.message?.role !== "assistant") continue;
+        const stopReason = (r.message as JsonRecord).stop_reason;
+        if (stopReason !== "tool_use") continue;
+        const uuid = (r as JsonRecord).uuid as string | undefined;
+        if (!uuid || emittedUuids.has(uuid)) continue;
+        emittedUuids.add(uuid);
+        onIntermediateTurn(r);
+      }
+    }
+
     const row = assistantReplyFromRows(prompt, newRows);
     const durationMs = turnDurationMsFromRows(prompt, newRows);
     if (row && durationMs !== undefined) return { row, rows, durationMs };
