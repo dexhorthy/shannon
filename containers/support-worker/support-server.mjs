@@ -135,12 +135,59 @@ export async function processShannonStream(
 
   let isError = false;
 
+  // Deduplicate tool_use blocks across the two ways Shannon surfaces them:
+  //
+  //   1. `shannon_tool_use` events from runShannon's `agentEvents` — covers
+  //      tool_use blocks in EVERY row of the turn (turnRows), including
+  //      rows that are NOT `assistant.row` (the row waitForAssistantReply
+  //      returned).
+  //   2. `tool_use` blocks inside the chosen assistant message — covers
+  //      whatever was in `assistant.row` specifically.
+  //
+  // Concrete failure mode we're protecting against: the support agent often
+  // emits text first (row N) THEN a single send_response tool_use (row N+1).
+  // assistantReplyFromRows picks row N as the reply, so the assistant
+  // message Shannon yields has only text — the tool_use is ONLY visible via
+  // shannon_tool_use. Without handling that event, send_response is invisible
+  // to the caller. Without dedup, the simpler "agent emits text + tool_use
+  // in ONE row" case (which the existing tests use) would double-count.
+  const seenToolUseIds = new Set();
+
   for await (const msg of iter) {
     if (!msg || typeof msg !== "object" || typeof msg.type !== "string") continue;
 
     if (msg.type === "system" && msg.subtype === "init") {
       if (typeof msg.session_id === "string" && msg.session_id) {
         ref.value = msg.session_id;
+      }
+      continue;
+    }
+
+    if (msg.type === "shannon_tool_use") {
+      // Shannon's `toSdkToolUseEvents` emits these per tool_use block in
+      // every turnRow. Use them as the primary source so we don't miss
+      // tool calls in rows OTHER than the chosen assistant.row.
+      if (typeof msg.session_id === "string" && msg.session_id) {
+        ref.value = msg.session_id;
+      }
+      const id = typeof msg.tool_use_id === "string" ? msg.tool_use_id : null;
+      const rawName = typeof msg.tool_name === "string" ? msg.tool_name : "";
+      const name = stripMcpPrefix(rawName);
+      if (!name) continue;
+      // Skip if we already recorded this same tool_use under either path —
+      // the same id can arrive twice when assistant.row is the row containing
+      // the tool_use (it's in agentEvents AND in the assistant message).
+      if (id && seenToolUseIds.has(id)) continue;
+      if (id) seenToolUseIds.add(id);
+      progress.toolCalls.push(name);
+      if (name === "send_response") {
+        const input = msg.input && typeof msg.input === "object" ? msg.input : {};
+        const finalMsg = typeof input.message === "string" ? input.message : "";
+        if (finalMsg) {
+          write(sseFrame("response", { content: finalMsg, delta: false }));
+        }
+      } else {
+        write(sseFrame("status", { tool: name }));
       }
       continue;
     }
@@ -164,6 +211,11 @@ export async function processShannonStream(
             write(sseFrame("status", { content: text }));
           }
         } else if (block.type === "tool_use") {
+          const id = typeof block.id === "string" ? block.id : null;
+          // Same dedup key as the shannon_tool_use branch — when both paths
+          // surface the same tool_use, only the FIRST one wins.
+          if (id && seenToolUseIds.has(id)) continue;
+          if (id) seenToolUseIds.add(id);
           const rawName = typeof block.name === "string" ? block.name : "";
           const name = stripMcpPrefix(rawName);
           if (name) progress.toolCalls.push(name);

@@ -596,6 +596,134 @@ describe("buildHandler / POST /invoke/stream", () => {
     expect(results[0].data.cost).toBe(0.0123);
   });
 
+  test(
+    "shannon_tool_use event surfaces tool_use from row OTHER than assistant.row",
+    async () => {
+      // Reproduces the real-world support-agent flow: the agent emits text
+      // in row N (which Shannon's `assistantReplyFromRows` picks as the
+      // reply) and then send_response in row N+1. Shannon's runShannon
+      // emits a separate `shannon_tool_use` event for the tool_use row
+      // (since it's part of turnRows) BEFORE yielding the assistant
+      // message that only carries the text row. Pre-fix support-server.mjs
+      // ignored `shannon_tool_use` events and the result frame ended up
+      // with tool_calls=[].
+      const handler = buildHandler({
+        queryFn: () =>
+          fromArray([
+            {
+              type: "system",
+              subtype: "init",
+              session_id: "sess-multi-row",
+            },
+            // Standalone shannon_tool_use event for the tool_use-only row.
+            {
+              type: "shannon_tool_use",
+              tool_use_id: "tu-1",
+              tool_name: "mcp__support_tools__send_response",
+              input: { message: "Welcome!" },
+              session_id: "sess-multi-row",
+            },
+            // assistant.row — text-only content. The tool_use lives in
+            // ANOTHER row and is only delivered via shannon_tool_use above.
+            {
+              type: "assistant",
+              session_id: "sess-multi-row",
+              message: {
+                role: "assistant",
+                content: [{ type: "text", text: "Welcome!" }],
+              },
+            },
+            {
+              type: "result",
+              session_id: "sess-multi-row",
+              total_cost_usd: 0.001,
+              duration_ms: 1234,
+              is_error: false,
+            },
+          ]),
+      });
+      const resp = await handler(
+        new Request("http://test.local/invoke/stream", {
+          method: "POST",
+          body: JSON.stringify({ message: "hi" }),
+        }),
+      );
+      const frames = await readSseFrames(resp);
+      const result = frames.find((f) => f.event === "result");
+      expect(result).toBeDefined();
+      expect(result?.data.tool_calls).toEqual(["send_response"]);
+      // The response SSE frame should also fire from the shannon_tool_use
+      // branch, so platform UI consumers still get the final reply.
+      const response = frames.find((f) => f.event === "response");
+      expect(response).toBeDefined();
+      expect(response?.data.content).toBe("Welcome!");
+    },
+  );
+
+  test(
+    "tool_use in BOTH shannon_tool_use AND assistant.row → recorded ONCE (dedup)",
+    async () => {
+      // Defends the dedup latch: when Shannon picks a row that itself
+      // contains the tool_use as the assistant.row, the same tool_use
+      // shows up in agentEvents AND in the assistant message. The
+      // toolCalls accumulator must NOT double-count it.
+      const handler = buildHandler({
+        queryFn: () =>
+          fromArray([
+            {
+              type: "system",
+              subtype: "init",
+              session_id: "sess-dedup",
+            },
+            {
+              type: "shannon_tool_use",
+              tool_use_id: "tu-same",
+              tool_name: "mcp__support_tools__send_response",
+              input: { message: "ok" },
+              session_id: "sess-dedup",
+            },
+            // Same tool_use_id appears in assistant.row's content too —
+            // realistic when row N IS the row chosen as assistant.row.
+            {
+              type: "assistant",
+              session_id: "sess-dedup",
+              message: {
+                role: "assistant",
+                content: [
+                  {
+                    type: "tool_use",
+                    id: "tu-same",
+                    name: "mcp__support_tools__send_response",
+                    input: { message: "ok" },
+                  },
+                ],
+              },
+            },
+            {
+              type: "result",
+              session_id: "sess-dedup",
+              total_cost_usd: 0.001,
+              duration_ms: 800,
+              is_error: false,
+            },
+          ]),
+      });
+      const resp = await handler(
+        new Request("http://test.local/invoke/stream", {
+          method: "POST",
+          body: JSON.stringify({ message: "hi" }),
+        }),
+      );
+      const frames = await readSseFrames(resp);
+      const result = frames.find((f) => f.event === "result");
+      expect(result).toBeDefined();
+      expect(result?.data.tool_calls).toEqual(["send_response"]);
+      // Exactly ONE response frame, not two.
+      const responseFrames = frames.filter((f) => f.event === "response");
+      expect(responseFrames).toHaveLength(1);
+    },
+  );
+
   test("multiple tool_use blocks before no_result_message → all accumulated", async () => {
     // Defends against future regressions where the toolCalls accumulator
     // only tracks the LAST tool_use block. The support agent occasionally
