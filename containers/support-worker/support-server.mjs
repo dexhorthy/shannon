@@ -237,6 +237,11 @@ export function buildHandler({ queryFn = query } = {}) {
     }
 
     const queryOptions = {
+      // Shannon's query() defaults command to "shannon" and tries to exec it
+      // off PATH. Inside this image the runnable is /app/bin/shannon.mjs (no
+      // shannon binary on PATH) so we point at it directly. Matches the same
+      // pattern tracer/tracer.ts uses.
+      command: "/app/bin/shannon.mjs",
       systemPrompt: typeof system_prompt === "string" ? system_prompt : undefined,
       model: typeof model === "string" ? model : undefined,
       resume: typeof session_id === "string" && session_id ? session_id : undefined,
