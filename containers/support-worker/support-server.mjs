@@ -84,8 +84,17 @@ export function stripMcpPrefix(name) {
  * tmux mode coalesces per turn, so the AssistantMessage carries the full
  * content. Mapping deltas would risk double-emitting the same prose.
  */
-export async function processShannonStream(iter, write, initialSessionId = null) {
-  let sessionId = initialSessionId;
+export async function processShannonStream(iter, write, initialSessionId = null, sessionIdRef = null) {
+  // sessionIdRef is an optional `{value: ...}` container the caller passes so
+  // it can read the most-recently captured session id even if `iter` throws
+  // mid-iteration (Shannon's underlying process can exit non-zero after
+  // yielding system/init but before the result message, e.g. on
+  // "Timed out waiting for assistant reply"). Without this, the catch path
+  // in buildHandler() would fall back to the inbound request's session_id
+  // (often null on first turn) and the client would lose the just-created
+  // session id, breaking --resume on the next turn.
+  const ref = sessionIdRef ?? { value: initialSessionId };
+  if (ref.value == null) ref.value = initialSessionId;
   let totalCost = 0;
   let durationMs = 0;
   const toolCalls = [];
@@ -97,14 +106,14 @@ export async function processShannonStream(iter, write, initialSessionId = null)
 
     if (msg.type === "system" && msg.subtype === "init") {
       if (typeof msg.session_id === "string" && msg.session_id) {
-        sessionId = msg.session_id;
+        ref.value = msg.session_id;
       }
       continue;
     }
 
     if (msg.type === "assistant") {
       if (typeof msg.session_id === "string" && msg.session_id) {
-        sessionId = msg.session_id;
+        ref.value = msg.session_id;
       }
       const content = msg.message?.content;
       if (!Array.isArray(content)) continue;
@@ -141,13 +150,13 @@ export async function processShannonStream(iter, write, initialSessionId = null)
 
     if (msg.type === "result") {
       if (typeof msg.session_id === "string" && msg.session_id) {
-        sessionId = msg.session_id;
+        ref.value = msg.session_id;
       }
       totalCost = typeof msg.total_cost_usd === "number" ? msg.total_cost_usd : 0;
       durationMs = typeof msg.duration_ms === "number" ? msg.duration_ms : 0;
       isError = Boolean(msg.is_error);
       const payload = {
-        session_id: sessionId,
+        session_id: ref.value,
         cost: totalCost,
         duration_ms: durationMs,
         tool_calls: toolCalls,
@@ -161,7 +170,7 @@ export async function processShannonStream(iter, write, initialSessionId = null)
     }
   }
 
-  return { sessionId, totalCost, durationMs, toolCalls, isError, resultEmitted };
+  return { sessionId: ref.value, totalCost, durationMs, toolCalls, isError, resultEmitted };
 }
 
 /**
@@ -267,12 +276,23 @@ export function buildHandler({ queryFn = query } = {}) {
             closed = true;
           }
         };
+        // Outer-scope session id container so the catch path below can still
+        // emit the session id captured from `system/init` even if the
+        // underlying Shannon process throws (e.g. "Timed out waiting for
+        // assistant reply") AFTER yielding the init message. Without this
+        // ref, the catch fell back to the inbound request's session_id
+        // (null on first turn), and the client lost --resume on the next
+        // turn.
+        const sessionIdRef = {
+          value: typeof session_id === "string" ? session_id : null,
+        };
         try {
           const iter = queryFn({ prompt: message, options: queryOptions });
           const { resultEmitted, sessionId } = await processShannonStream(
             iter,
             safeWrite,
             typeof session_id === "string" ? session_id : null,
+            sessionIdRef,
           );
           if (!resultEmitted) {
             safeWrite(
@@ -289,7 +309,7 @@ export function buildHandler({ queryFn = query } = {}) {
         } catch (err) {
           safeWrite(
             sseFrame("result", {
-              session_id: typeof session_id === "string" ? session_id : null,
+              session_id: sessionIdRef.value,
               cost: 0,
               duration_ms: 0,
               tool_calls: [],
