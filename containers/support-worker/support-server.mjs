@@ -355,6 +355,11 @@ if (import.meta.main) {
   Bun.serve({
     port: PORT,
     fetch: fetchHandler,
+    // Bun.serve defaults to a 10s idle timeout, which the SSE stream blows
+    // past on every non-trivial turn (agent thinking + tool calls). Bun caps
+    // idleTimeout at 255 — pick that max so it stays just under the python
+    // read timeout (280s).
+    idleTimeout: 255,
   });
   console.log(`shannon-support-worker listening on :${PORT}`);
 }
