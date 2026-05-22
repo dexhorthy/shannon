@@ -50,6 +50,7 @@ export type QueryOptions = {
   ide?: boolean;
   includeHookEvents?: boolean;
   includePartialMessages?: boolean;
+  printMode?: boolean;
   jsonSchema?: string | Record<string, unknown>;
   maxBudgetUsd?: number;
   mcpDebug?: boolean;
@@ -402,6 +403,7 @@ export const shannonQueryOptionsSchema = z.object({
   ide: z.boolean().optional(),
   includeHookEvents: z.boolean().optional(),
   includePartialMessages: z.boolean().optional(),
+  printMode: z.boolean().optional(),
   jsonSchema: z.union([z.string(), z.record(z.string(), z.unknown())]).optional(),
   maxBudgetUsd: z.number().optional(),
   mcpDebug: z.boolean().optional(),
@@ -945,6 +947,7 @@ export function optionsToCliArgs(options: QueryOptions): string[] {
   addBoolean(args, "--ide", options.ide);
   addBoolean(args, "--include-hook-events", options.includeHookEvents);
   addBoolean(args, "--include-partial-messages", options.includePartialMessages);
+  addBoolean(args, "--print-mode", options.printMode);
   addJsonOrString(args, "--json-schema", options.jsonSchema);
   addString(args, "--max-budget-usd", options.maxBudgetUsd);
   addRepeated(args, "--mcp-config", options.mcpConfig);

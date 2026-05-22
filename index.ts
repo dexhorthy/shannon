@@ -13,6 +13,7 @@ type CliOptions = {
   verbose: boolean;
   replayUserMessages: boolean;
   includePartialMessages: boolean;
+  printMode: boolean;
   cwd: string;
   pathToClaudeCodeExecutable?: string;
   claudeArgs: string[];
@@ -171,6 +172,7 @@ export function parseArgs(argv: string[], cwd = process.cwd()): CliOptions {
     .option("--ide", "auto-connect to IDE")
     .option("--include-hook-events", "include hook lifecycle events")
     .option("--include-partial-messages", "include partial message chunks")
+    .option("--print-mode", "use claude -p directly for real token streaming (skips tmux)", false)
     .option("--json-schema <schema>", "JSON schema for structured output")
     .option("--max-budget-usd <amount>", "maximum API budget")
     .option("--mcp-config <configs...>", "MCP configs")
@@ -237,6 +239,7 @@ export function parseArgs(argv: string[], cwd = process.cwd()): CliOptions {
     verbose: parsed.verbose,
     replayUserMessages: parsed.replayUserMessages === true,
     includePartialMessages: parsed.includePartialMessages === true,
+    printMode: parsed.printMode === true,
     cwd: resolve(cwd),
     pathToClaudeCodeExecutable: typeof parsed.pathToClaudeCodeExecutable === "string"
       ? parsed.pathToClaudeCodeExecutable
@@ -399,6 +402,78 @@ export function toSdkPartialAssistant(row: TranscriptRow): JsonRecord | undefine
     session_id: sessionId,
     uuid: randomUUID(),
   };
+}
+
+export function toSdkThinkingEvents(row: TranscriptRow): JsonRecord[] {
+  const content = row.message?.content;
+  const sessionId = row.sessionId ?? row.session_id;
+  if (!Array.isArray(content) || !sessionId) return [];
+
+  const events: JsonRecord[] = [];
+  for (const block of content) {
+    if (!block || typeof block !== "object") continue;
+    const b = block as { type?: string; thinking?: string; signature?: string };
+    if (b.type !== "thinking") continue;
+    events.push({
+      type: "shannon_thinking",
+      thinking: b.thinking ?? "",
+      thinking_chars: (b.thinking ?? "").length,
+      signature_present: typeof b.signature === "string" && b.signature.length > 0,
+      session_id: sessionId,
+      uuid: randomUUID(),
+    });
+  }
+  return events;
+}
+
+export function toSdkToolUseEvents(row: TranscriptRow): JsonRecord[] {
+  const content = row.message?.content;
+  const sessionId = row.sessionId ?? row.session_id;
+  if (!Array.isArray(content) || !sessionId) return [];
+
+  const events: JsonRecord[] = [];
+  for (const block of content) {
+    if (!block || typeof block !== "object") continue;
+    const b = block as { type?: string; id?: string; name?: string; input?: JsonRecord };
+    if (b.type !== "tool_use") continue;
+    events.push({
+      type: "shannon_tool_use",
+      tool_use_id: b.id,
+      tool_name: b.name,
+      input: b.input ?? {},
+      session_id: sessionId,
+      uuid: randomUUID(),
+    });
+  }
+  return events;
+}
+
+export function toSdkToolResultEvents(row: TranscriptRow): JsonRecord[] {
+  const content = row.message?.content;
+  const sessionId = row.sessionId ?? row.session_id;
+  if (!Array.isArray(content) || !sessionId) return [];
+
+  const events: JsonRecord[] = [];
+  for (const block of content) {
+    if (!block || typeof block !== "object") continue;
+    const b = block as { type?: string; tool_use_id?: string; content?: unknown; is_error?: boolean };
+    if (b.type !== "tool_result") continue;
+    const text = typeof b.content === "string"
+      ? b.content
+      : Array.isArray(b.content)
+        ? b.content.map((c) => (c && typeof c === "object" && "text" in c ? String((c as { text: unknown }).text) : "")).join("")
+        : "";
+    events.push({
+      type: "shannon_tool_result",
+      tool_use_id: b.tool_use_id,
+      is_error: b.is_error === true,
+      result_chars: text.length,
+      result_preview: text.slice(0, 200),
+      session_id: sessionId,
+      uuid: randomUUID(),
+    });
+  }
+  return events;
 }
 
 export function toSdkHookResponse(row: TranscriptRow): JsonRecord | undefined {
@@ -677,6 +752,28 @@ export function promptFromUserMessage(message: JsonRecord): string | undefined {
   return text || undefined;
 }
 
+// "Did the assistant emit something meaningful?" — used by waitForAssistantReply
+// to decide a turn produced output. Text counts; so does a tool_use block.
+// Thinking-only is intentionally ignored — claude emits a thinking row before
+// every action and we don't want to treat that as a finished reply.
+//
+// Why tool_use counts: the support agent terminates its turn with a single
+// `mcp__support_tools__send_response` tool call (no following text). Before
+// this change, `assistantReplyFromRows` only looked at text content, so any
+// turn whose terminal action was a tool call ran out the full `TURN_TIMEOUT_MS`
+// and threw "Timed out waiting for assistant reply" — even though the user
+// already got their reply via the MCP write into the response slot.
+export function rowHasAssistantOutput(row: TranscriptRow): boolean {
+  if (row.type !== "assistant" || row.message?.role !== "assistant") return false;
+  if (textFromContent(row.message.content)) return true;
+  const content = row.message?.content;
+  if (!Array.isArray(content)) return false;
+  return content.some(
+    (block) =>
+      block && typeof block === "object" && "type" in block && block.type === "tool_use",
+  );
+}
+
 export function assistantReplyFromRows(prompt: string, rows: TranscriptRow[]): TranscriptRow | undefined {
   let sawPrompt = false;
 
@@ -686,8 +783,8 @@ export function assistantReplyFromRows(prompt: string, rows: TranscriptRow[]): T
       continue;
     }
 
-    if (!sawPrompt || row.type !== "assistant" || row.message?.role !== "assistant") continue;
-    if (textFromContent(row.message.content)) return row;
+    if (!sawPrompt) continue;
+    if (rowHasAssistantOutput(row)) return row;
   }
 }
 
@@ -703,7 +800,7 @@ export function turnDurationMsFromRows(prompt: string, rows: TranscriptRow[]): n
     }
 
     if (!sawPrompt) continue;
-    if (row.type === "assistant" && row.message?.role === "assistant" && textFromContent(row.message.content)) {
+    if (rowHasAssistantOutput(row)) {
       sawAssistantReply = true;
       continue;
     }
@@ -726,6 +823,10 @@ async function main() {
 }
 
 export async function runShannon(options: CliOptions) {
+  if (options.printMode) {
+    return runShannonPrint(options);
+  }
+
   const runtime = await validateRuntime(options.pathToClaudeCodeExecutable);
 
   const tmuxSession = `shannon-${randomUUID()}`;
@@ -839,6 +940,7 @@ export async function runShannon(options: CliOptions) {
         }
       }
 
+      const priorRowCount = transcriptRowCount;
       const assistant = await waitForAssistantReply(
         meta.transcriptPath,
         prompt,
@@ -846,9 +948,16 @@ export async function runShannon(options: CliOptions) {
         transcriptRowCount,
       );
       transcriptRowCount = assistant.rows.length;
+      const turnRows = assistant.rows.slice(priorRowCount);
       const result = toSdkResult(assistant.row, startedAt, promptCount, assistant.durationMs);
       const partial = options.includePartialMessages ? toSdkPartialAssistant(assistant.row) : undefined;
+      const agentEvents = turnRows.flatMap((row) => [
+        ...toSdkThinkingEvents(row),
+        ...toSdkToolUseEvents(row),
+        ...toSdkToolResultEvents(row),
+      ]);
       const turnMessages = [
+        ...agentEvents,
         ...(partial ? [partial] : []),
         toSdkAssistant(assistant.row),
         result,
@@ -913,6 +1022,144 @@ function installSignalHandlers({
     process.off("SIGINT", handler);
     process.off("SIGTERM", handler);
   };
+}
+
+async function runShannonPrint(options: CliOptions) {
+  const claudeExe = await findExecutable(options.pathToClaudeCodeExecutable ?? "claude");
+  if (!claudeExe) {
+    throw new Error(`Missing required executable: claude. Install Claude Code and make sure it is on PATH.`);
+  }
+
+  const isStreamingInput = options.inputFormat === "stream-json";
+  const args: string[] = ["-p"];
+  if (isStreamingInput) {
+    args.push("--input-format=stream-json");
+  } else if (options.prompt) {
+    args.push(options.prompt);
+  }
+  args.push(`--output-format=${options.outputFormat}`);
+  if (options.verbose || options.outputFormat === "stream-json") {
+    args.push("--verbose");
+  }
+  if (options.replayUserMessages) args.push("--replay-user-messages");
+  if (options.includePartialMessages) args.push("--include-partial-messages");
+  args.push(...options.claudeArgs);
+
+  let sessionId: string | undefined;
+  let projectFolder: string | undefined;
+  const jsonMessages: JsonRecord[] = [];
+  const stderrChunks: string[] = [];
+  let metadataEmitted = false;
+
+  const proc = Bun.spawn([claudeExe, ...args], {
+    cwd: options.cwd,
+    stdin: isStreamingInput ? "pipe" : "ignore",
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+
+  const onSignal = () => {
+    try { proc.kill("SIGTERM"); } catch { /* ignore */ }
+  };
+  process.on("SIGINT", onSignal);
+  process.on("SIGTERM", onSignal);
+
+  const emit = (msg: JsonRecord) => {
+    if (options.outputFormat === "json") jsonMessages.push(msg);
+    else emitJson(msg);
+  };
+
+  if (isStreamingInput && proc.stdin) {
+    const stdinWriter = proc.stdin as { write: (v: Uint8Array | string) => unknown; end: () => unknown };
+    (async () => {
+      try {
+        for await (const chunk of Bun.stdin.stream()) {
+          if (chunk) stdinWriter.write(chunk);
+        }
+      } catch {
+        // ignore stdin errors
+      } finally {
+        try { stdinWriter.end(); } catch { /* ignore */ }
+      }
+    })();
+  }
+
+  (async () => {
+    const decoder = new TextDecoder();
+    try {
+      const reader = (proc.stderr as ReadableStream<Uint8Array>).getReader();
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        if (value) stderrChunks.push(decoder.decode(value, { stream: true }));
+      }
+    } catch {
+      // ignore
+    }
+  })();
+
+  const decoder = new TextDecoder();
+  let buffer = "";
+  const stdoutReader = (proc.stdout as ReadableStream<Uint8Array>).getReader();
+  while (true) {
+    const { value, done } = await stdoutReader.read();
+    if (done) break;
+    if (!value) continue;
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split("\n");
+    buffer = lines.pop() ?? "";
+
+    for (const line of lines) {
+      if (!line.trim()) continue;
+      let msg: JsonRecord;
+      try {
+        msg = JSON.parse(line) as JsonRecord;
+      } catch {
+        continue;
+      }
+
+      if (!sessionId && typeof msg.session_id === "string") sessionId = msg.session_id;
+      if (!projectFolder && typeof msg.cwd === "string") {
+        projectFolder = claudeProjectFolder(msg.cwd);
+      }
+
+      emit(msg);
+
+      if (msg.type === "user") {
+        const row: TranscriptRow = {
+          type: msg.type,
+          sessionId,
+          session_id: sessionId,
+          message: msg.message as TranscriptRow["message"],
+        };
+        for (const ev of toSdkToolResultEvents(row)) emit(ev);
+      }
+    }
+  }
+
+  const exitCode = await proc.exited;
+  process.off("SIGINT", onSignal);
+  process.off("SIGTERM", onSignal);
+
+  if (!metadataEmitted && sessionId && projectFolder && options.outputFormat === "stream-json") {
+    metadataEmitted = true;
+    const meta: SessionMetadata = {
+      sessionId,
+      projectFolder,
+      transcriptPath: join(projectFolder, `${sessionId}.jsonl`),
+      tmuxSession: "",
+      cwd: options.cwd,
+    };
+    emit(toShannonMetadata(meta, {
+      tmux_killed: false,
+      exit_code: exitCode,
+      stderr: stderrChunks.join("").slice(0, 4000),
+    }));
+  }
+
+  if (options.outputFormat === "json") {
+    process.stdout.write(`${JSON.stringify(jsonMessages)}\n`);
+  }
 }
 
 export async function validateRuntime(claudeExecutable = "claude") {
@@ -1072,6 +1319,14 @@ async function waitForAssistantReply(
       pendingRow = row;
       pendingRows = rows;
       pendingStartedAt = Date.now();
+    } else if (row) {
+      // Keep the rows snapshot fresh while we're inside the grace period.
+      // The default tool-use-terminal path (support agent calling send_response
+      // as its last action) means claude is still emitting tool_result rows
+      // after the assistant tool_use; capturing the most-recent transcript
+      // ensures the caller's `agentEvents` loop downstream sees them too.
+      pendingRow = row;
+      pendingRows = rows;
     }
     if (pendingRow && Date.now() - pendingStartedAt >= TURN_DURATION_GRACE_MS) {
       return { row: pendingRow, rows: pendingRows ?? rows };

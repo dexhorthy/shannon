@@ -84,7 +84,13 @@ export function stripMcpPrefix(name) {
  * tmux mode coalesces per turn, so the AssistantMessage carries the full
  * content. Mapping deltas would risk double-emitting the same prose.
  */
-export async function processShannonStream(iter, write, initialSessionId = null, sessionIdRef = null) {
+export async function processShannonStream(
+  iter,
+  write,
+  initialSessionId = null,
+  sessionIdRef = null,
+  progressRef = null,
+) {
   // sessionIdRef is an optional `{value: ...}` container the caller passes so
   // it can read the most-recently captured session id even if `iter` throws
   // mid-iteration (Shannon's underlying process can exit non-zero after
@@ -95,11 +101,39 @@ export async function processShannonStream(iter, write, initialSessionId = null,
   // session id, breaking --resume on the next turn.
   const ref = sessionIdRef ?? { value: initialSessionId };
   if (ref.value == null) ref.value = initialSessionId;
-  let totalCost = 0;
-  let durationMs = 0;
-  const toolCalls = [];
+
+  // progressRef is an optional `{toolCalls, totalCost, durationMs, resultEmitted}`
+  // container for the same reason as sessionIdRef but for tool-call / cost /
+  // duration telemetry: the synthetic "no_result_message" frame and the
+  // catch-path synthetic frame in buildHandler() used to write `tool_calls: []`
+  // / cost:0 / duration_ms:0 and throw away whatever we had already accumulated.
+  // That matters in real life: the enforcer's resumed second attempt can call
+  // `mcp__support_tools__send_response` AND THEN Shannon exits with
+  // "Timed out waiting for assistant reply" before emitting the result line —
+  // so the slot is populated, the user gets their reply, but the SSE result
+  // frame the caller sees has `tool_calls: []`. With progressRef the caller
+  // sees the actual `["send_response"]` it accumulated.
+  //
+  // `resultEmitted` lives on the ref too so the catch path in buildHandler can
+  // tell whether a real result already went out (it must NOT emit a second
+  // synthetic on top of a real one — the python worker treats each result
+  // event as the final state of the turn, so two would clobber).
+  const progress = progressRef ?? {
+    toolCalls: [],
+    totalCost: 0,
+    durationMs: 0,
+    resultEmitted: false,
+  };
+  // Always reset at the start — caller-provided refs are reused across
+  // sibling attempts inside the rotation/enforcer loop, and stale state would
+  // double-count or surface tool calls from a prior attempt. `.length = 0`
+  // clears IN PLACE so the outer reference the caller holds reflects the reset.
+  progress.toolCalls.length = 0;
+  progress.totalCost = 0;
+  progress.durationMs = 0;
+  progress.resultEmitted = false;
+
   let isError = false;
-  let resultEmitted = false;
 
   for await (const msg of iter) {
     if (!msg || typeof msg !== "object" || typeof msg.type !== "string") continue;
@@ -132,7 +166,7 @@ export async function processShannonStream(iter, write, initialSessionId = null,
         } else if (block.type === "tool_use") {
           const rawName = typeof block.name === "string" ? block.name : "";
           const name = stripMcpPrefix(rawName);
-          if (name) toolCalls.push(name);
+          if (name) progress.toolCalls.push(name);
           if (name === "send_response") {
             const finalMsg = block.input && typeof block.input.message === "string"
               ? block.input.message
@@ -152,25 +186,32 @@ export async function processShannonStream(iter, write, initialSessionId = null,
       if (typeof msg.session_id === "string" && msg.session_id) {
         ref.value = msg.session_id;
       }
-      totalCost = typeof msg.total_cost_usd === "number" ? msg.total_cost_usd : 0;
-      durationMs = typeof msg.duration_ms === "number" ? msg.duration_ms : 0;
+      progress.totalCost = typeof msg.total_cost_usd === "number" ? msg.total_cost_usd : 0;
+      progress.durationMs = typeof msg.duration_ms === "number" ? msg.duration_ms : 0;
       isError = Boolean(msg.is_error);
       const payload = {
         session_id: ref.value,
-        cost: totalCost,
-        duration_ms: durationMs,
-        tool_calls: toolCalls,
+        cost: progress.totalCost,
+        duration_ms: progress.durationMs,
+        tool_calls: progress.toolCalls,
       };
       if (isError) {
         payload.is_error = true;
         if (typeof msg.result === "string" && msg.result) payload.error = msg.result;
       }
       write(sseFrame("result", payload));
-      resultEmitted = true;
+      progress.resultEmitted = true;
     }
   }
 
-  return { sessionId: ref.value, totalCost, durationMs, toolCalls, isError, resultEmitted };
+  return {
+    sessionId: ref.value,
+    totalCost: progress.totalCost,
+    durationMs: progress.durationMs,
+    toolCalls: progress.toolCalls,
+    isError,
+    resultEmitted: progress.resultEmitted,
+  };
 }
 
 /**
@@ -286,6 +327,19 @@ export function buildHandler({ queryFn = query } = {}) {
         const sessionIdRef = {
           value: typeof session_id === "string" ? session_id : null,
         };
+        // progressRef captures what processShannonStream accumulated even if
+        // the inner iter throws (Shannon "Timed out waiting for assistant
+        // reply" after the agent already called send_response) OR ends
+        // without emitting a result message. Both synthetic-result branches
+        // below read from this so the SSE result frame the caller sees
+        // reports the actual tool_calls / cost / duration instead of
+        // dropping them to zeros — telemetry parity with the happy path.
+        const progressRef = {
+          toolCalls: [],
+          totalCost: 0,
+          durationMs: 0,
+          resultEmitted: false,
+        };
         try {
           const iter = queryFn({ prompt: message, options: queryOptions });
           const { resultEmitted, sessionId } = await processShannonStream(
@@ -293,30 +347,37 @@ export function buildHandler({ queryFn = query } = {}) {
             safeWrite,
             typeof session_id === "string" ? session_id : null,
             sessionIdRef,
+            progressRef,
           );
           if (!resultEmitted) {
             safeWrite(
               sseFrame("result", {
                 session_id: sessionId,
-                cost: 0,
-                duration_ms: 0,
-                tool_calls: [],
+                cost: progressRef.totalCost,
+                duration_ms: progressRef.durationMs,
+                tool_calls: progressRef.toolCalls,
                 is_error: true,
                 error: "no_result_message",
               }),
             );
           }
         } catch (err) {
-          safeWrite(
-            sseFrame("result", {
-              session_id: sessionIdRef.value,
-              cost: 0,
-              duration_ms: 0,
-              tool_calls: [],
-              is_error: true,
-              error: err instanceof Error ? err.message : String(err),
-            }),
-          );
+          // Only emit a synthetic-error result frame if processShannonStream
+          // had NOT already written a real one — otherwise the python worker
+          // sees two result events for the same attempt and the second one
+          // (with cost=0 and is_error=true) clobbers the first's telemetry.
+          if (!progressRef.resultEmitted) {
+            safeWrite(
+              sseFrame("result", {
+                session_id: sessionIdRef.value,
+                cost: progressRef.totalCost,
+                duration_ms: progressRef.durationMs,
+                tool_calls: progressRef.toolCalls,
+                is_error: true,
+                error: err instanceof Error ? err.message : String(err),
+              }),
+            );
+          }
         } finally {
           cleanupMcpConfigDir(tmpDir);
           try {

@@ -502,6 +502,194 @@ describe("buildHandler / POST /invoke/stream", () => {
     expect(result?.data.session_id).toBe("sess-no-result");
   });
 
+  test(
+    "tool_use then no_result_message → synthetic result preserves tool_calls",
+    async () => {
+      // Reproduces the enforcer-resumed bug: agent yields an assistant message
+      // that includes a send_response tool_use block, then Shannon ends the
+      // stream without ever emitting a result message. Pre-fix we hard-coded
+      // tool_calls=[] in the synthetic; the slot was populated so the user
+      // got their reply, but downstream telemetry lost the toolCalls
+      // accumulator. Post-fix the synthetic must report what we actually saw.
+      const handler = buildHandler({
+        queryFn: () =>
+          fromArray([
+            {
+              type: "system",
+              subtype: "init",
+              session_id: "sess-tu-no-result",
+            },
+            {
+              type: "assistant",
+              session_id: "sess-tu-no-result",
+              message: {
+                role: "assistant",
+                content: [
+                  {
+                    type: "tool_use",
+                    name: "mcp__support_tools__send_response",
+                    input: { message: "hello" },
+                  },
+                ],
+              },
+            },
+          ]),
+      });
+      const resp = await handler(
+        new Request("http://test.local/invoke/stream", {
+          method: "POST",
+          body: JSON.stringify({ message: "hi" }),
+        }),
+      );
+      const frames = await readSseFrames(resp);
+      const result = frames.find((f) => f.event === "result");
+      expect(result).toBeDefined();
+      expect(result?.data.is_error).toBe(true);
+      expect(result?.data.error).toBe("no_result_message");
+      expect(result?.data.tool_calls).toEqual(["send_response"]);
+    },
+  );
+
+  test("real result then queryFn throws → catch does NOT emit a second synthetic", async () => {
+    // Defensive: pre-fix the catch path always emitted a synthetic result
+    // frame, even if processShannonStream had already written a real result
+    // before the throw. Downstream the python worker treats each result
+    // event as the final state of the turn, so a trailing synthetic with
+    // cost=0/is_error=true would clobber the real one. The fix gates the
+    // catch-path synthetic on progressRef.resultEmitted=false.
+    const handler = buildHandler({
+      queryFn: () =>
+        (async function* () {
+          yield {
+            type: "system",
+            subtype: "init",
+            session_id: "sess-late-throw",
+          };
+          yield {
+            type: "assistant",
+            session_id: "sess-late-throw",
+            message: {
+              role: "assistant",
+              content: [{ type: "text", text: "ok" }],
+            },
+          };
+          yield {
+            type: "result",
+            session_id: "sess-late-throw",
+            total_cost_usd: 0.0123,
+            duration_ms: 4567,
+            is_error: false,
+          };
+          throw new Error("post-result fault");
+        })(),
+    });
+    const resp = await handler(
+      new Request("http://test.local/invoke/stream", {
+        method: "POST",
+        body: JSON.stringify({ message: "hi" }),
+      }),
+    );
+    const frames = await readSseFrames(resp);
+    const results = frames.filter((f) => f.event === "result");
+    expect(results).toHaveLength(1);
+    expect(results[0].data.is_error).toBeUndefined();
+    expect(results[0].data.cost).toBe(0.0123);
+  });
+
+  test("multiple tool_use blocks before no_result_message → all accumulated", async () => {
+    // Defends against future regressions where the toolCalls accumulator
+    // only tracks the LAST tool_use block. The support agent occasionally
+    // chains an MCP read (e.g. mcp__idoneachat-platform__list_scenarios)
+    // followed by send_response; the synthetic-result branch must report
+    // both tools, in order.
+    const handler = buildHandler({
+      queryFn: () =>
+        fromArray([
+          {
+            type: "system",
+            subtype: "init",
+            session_id: "sess-multi-tu",
+          },
+          {
+            type: "assistant",
+            session_id: "sess-multi-tu",
+            message: {
+              role: "assistant",
+              content: [
+                {
+                  type: "tool_use",
+                  name: "mcp__idoneachat-platform__list_scenarios",
+                  input: {},
+                },
+                {
+                  type: "tool_use",
+                  name: "mcp__support_tools__send_response",
+                  input: { message: "done" },
+                },
+              ],
+            },
+          },
+        ]),
+    });
+    const resp = await handler(
+      new Request("http://test.local/invoke/stream", {
+        method: "POST",
+        body: JSON.stringify({ message: "hi" }),
+      }),
+    );
+    const frames = await readSseFrames(resp);
+    const result = frames.find((f) => f.event === "result");
+    expect(result).toBeDefined();
+    expect(result?.data.tool_calls).toEqual(["list_scenarios", "send_response"]);
+  });
+
+  test("tool_use then queryFn throws → catch synthetic preserves tool_calls", async () => {
+    // Same shape as above but the iter rejects mid-stream (the real-world
+    // "shannon exited with 1: Timed out waiting for assistant reply" error
+    // surfaces this way). The catch block in buildHandler used to write
+    // tool_calls=[] regardless of what processShannonStream had already
+    // pushed onto its accumulator; this test pins the fix.
+    const handler = buildHandler({
+      queryFn: () =>
+        (async function* () {
+          yield {
+            type: "system",
+            subtype: "init",
+            session_id: "sess-tu-throw",
+          };
+          yield {
+            type: "assistant",
+            session_id: "sess-tu-throw",
+            message: {
+              role: "assistant",
+              content: [
+                {
+                  type: "tool_use",
+                  name: "mcp__support_tools__send_response",
+                  input: { message: "hello" },
+                },
+              ],
+            },
+          };
+          throw new Error("shannon exited with 1: Timed out waiting for assistant reply");
+        })(),
+    });
+    const resp = await handler(
+      new Request("http://test.local/invoke/stream", {
+        method: "POST",
+        body: JSON.stringify({ message: "hi" }),
+      }),
+    );
+    const frames = await readSseFrames(resp);
+    const result = frames.find((f) => f.event === "result");
+    expect(result).toBeDefined();
+    expect(result?.data.is_error).toBe(true);
+    expect(result?.data.error).toBe("shannon exited with 1: Timed out waiting for assistant reply");
+    expect(result?.data.tool_calls).toEqual(["send_response"]);
+    // session_id captured from system/init survives the throw.
+    expect(result?.data.session_id).toBe("sess-tu-throw");
+  });
+
   test("AbortController is wired so client disconnect aborts the query", async () => {
     let observedAbortController: AbortController | undefined;
     const queryStarted = Promise.withResolvers<void>();

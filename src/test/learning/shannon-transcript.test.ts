@@ -52,6 +52,7 @@ test("parses the target CLI invocation shape", () => {
     verbose: true,
     replayUserMessages: false,
     includePartialMessages: false,
+    printMode: false,
     cwd: "/Users/dex/repos/dexhorthy/shannon",
     pathToClaudeCodeExecutable: undefined,
     claudeArgs: [],
@@ -411,6 +412,77 @@ test("selects text-bearing assistant rows after thinking-only transcript chunks"
 
   expect(row).toMatchObject({ uuid: "text-row" });
   expect(turnDurationMsFromRows("hello", rows)).toBe(1234);
+});
+
+test("accepts tool_use-only assistant rows as a reply (no text emitted)", () => {
+  // Reproduces the support-agent enforcer pattern: the agent's terminal action
+  // is a single mcp__support_tools__send_response tool call with no following
+  // text. Before the fix, `assistantReplyFromRows` only honored text content,
+  // so the reply was never detected and `waitForAssistantReply` ran out the
+  // 180s TURN_TIMEOUT_MS. With the fix, a tool_use block is also a reply.
+  const rows = [
+    {
+      type: "user",
+      message: { role: "user", content: "Hi" },
+    },
+    {
+      type: "assistant",
+      uuid: "thinking-row",
+      message: {
+        role: "assistant",
+        content: [{ type: "thinking", thinking: "", signature: "redacted" }],
+      },
+    },
+    {
+      type: "assistant",
+      uuid: "tool-use-row",
+      message: {
+        role: "assistant",
+        content: [
+          {
+            type: "tool_use",
+            id: "tool-1",
+            name: "mcp__support_tools__send_response",
+            input: { message: "Hi!" },
+          },
+        ],
+      },
+    },
+    {
+      type: "system",
+      subtype: "turn_duration",
+      durationMs: 4321,
+    },
+  ];
+  const row = assistantReplyFromRows("Hi", rows);
+  expect(row).toMatchObject({ uuid: "tool-use-row" });
+  // turn_duration is keyed off "saw assistant reply" — same rule now covers
+  // tool_use rows. Without this, the grace-period fallback would fire instead
+  // of the fast-path return, slowing every tool-only turn by 1s.
+  expect(turnDurationMsFromRows("Hi", rows)).toBe(4321);
+});
+
+test("thinking-only assistant row is still not treated as a reply", () => {
+  // Symmetric to the test above: relaxing the rule to include tool_use must
+  // NOT also relax it to include thinking-only rows, otherwise the reply
+  // detector would fire as soon as claude starts thinking — way before it
+  // has actually produced an answer.
+  const rows = [
+    {
+      type: "user",
+      message: { role: "user", content: "Hi" },
+    },
+    {
+      type: "assistant",
+      uuid: "thinking-row",
+      message: {
+        role: "assistant",
+        content: [{ type: "thinking", thinking: "", signature: "redacted" }],
+      },
+    },
+  ];
+  expect(assistantReplyFromRows("Hi", rows)).toBeUndefined();
+  expect(turnDurationMsFromRows("Hi", rows)).toBeUndefined();
 });
 
 test("estimates native-style cost from transcript usage", () => {
