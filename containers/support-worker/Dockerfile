@@ -22,7 +22,8 @@ RUN curl -fsSL https://bun.sh/install | bash -s "bun-v1.3.3" \
 # Install Claude Code. Official installer takes only a version arg
 # (stable|latest|VERSION) and installs to ~/.local/share/claude/versions/.
 # Symlink the resulting binary into /usr/local/bin so PATH works for tmux.
-RUN curl -fsSL https://claude.ai/install.sh | bash -s stable && \
+# Pinned to match the kalemiflow + idoneachat production fleet (2.1.37).
+RUN curl -fsSL https://claude.ai/install.sh | bash -s 2.1.37 && \
     ln -sf /root/.local/bin/claude /usr/local/bin/claude && \
     claude --version
 
