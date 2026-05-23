@@ -272,6 +272,109 @@ test("matches slash-command prompts that Claude rewrote into a command envelope"
   ).toBe(false);
 });
 
+test("matches no-arg slash-command prompts", () => {
+  // The args body is empty, so endsWith("") would match anything; the name
+  // anchor is what disambiguates the prompt.
+  const promptSentAt = Date.parse("2026-05-23T20:27:08.000Z");
+  const content =
+    "<command-message>status</command-message>" +
+    "<command-name>/status</command-name>" +
+    "<command-args></command-args>";
+
+  expect(
+    rowContainsPromptAfter(
+      {
+        type: "user",
+        timestamp: "2026-05-23T20:27:08.939Z",
+        message: { role: "user", content },
+      },
+      "/status",
+      promptSentAt,
+    ),
+  ).toBe(true);
+
+  // An unrelated prompt must not match a no-arg envelope just because args is empty.
+  expect(
+    rowContainsPromptAfter(
+      {
+        type: "user",
+        timestamp: "2026-05-23T20:27:08.939Z",
+        message: { role: "user", content },
+      },
+      "/something-else",
+      promptSentAt,
+    ),
+  ).toBe(false);
+});
+
+test("tolerates arbitrary whitespace between command name and args", () => {
+  // Claude's exact handling of the separator between name and args isn't
+  // documented; the matcher must accept whatever shape it takes.
+  const promptSentAt = Date.parse("2026-05-23T20:27:08.000Z");
+  const args = "FOO";
+  const content =
+    "<command-message>cmd</command-message>" +
+    "<command-name>/cmd</command-name>" +
+    `<command-args>${args}</command-args>`;
+
+  for (const separator of [" ", "  ", "\n", "\n\n", " \n "]) {
+    expect(
+      rowContainsPromptAfter(
+        {
+          type: "user",
+          timestamp: "2026-05-23T20:27:08.939Z",
+          message: { role: "user", content },
+        },
+        `/cmd${separator}${args}`,
+        promptSentAt,
+      ),
+    ).toBe(true);
+  }
+});
+
+test("matches plugin-namespaced slash-command prompts", () => {
+  const promptSentAt = Date.parse("2026-05-23T20:27:08.000Z");
+  const content =
+    "<command-message>flight-deck:briefing</command-message>" +
+    "<command-name>/flight-deck:briefing</command-name>" +
+    "<command-args></command-args>";
+
+  expect(
+    rowContainsPromptAfter(
+      {
+        type: "user",
+        timestamp: "2026-05-23T20:27:08.939Z",
+        message: { role: "user", content },
+      },
+      "/flight-deck:briefing",
+      promptSentAt,
+    ),
+  ).toBe(true);
+});
+
+test("rejects an envelope whose command name is a prefix of the prompt's", () => {
+  // If a stale envelope's name is a prefix of our prompt's command name
+  // (envelope `/work`, prompt `/work-on-task FOO`), the gap between name and
+  // args body contains non-whitespace and the match must fail.
+  const promptSentAt = Date.parse("2026-05-23T20:27:08.000Z");
+  const content =
+    "<command-message>work</command-message>" +
+    "<command-name>/work</command-name>" +
+    "<command-args>FOO</command-args>";
+
+  expect(
+    rowContainsPromptAfter(
+      {
+        type: "user",
+        timestamp: "2026-05-23T20:27:08.939Z",
+        message: { role: "user", content },
+      },
+      "/work-on-task FOO",
+      promptSentAt,
+    ),
+  ).toBe(false);
+});
+
 test("extracts text from Anthropic content blocks", () => {
   expect(textFromContent([{ type: "text", text: "hello" }, { type: "tool_use" }])).toBe(
     "hello",

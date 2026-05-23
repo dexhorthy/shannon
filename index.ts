@@ -1036,13 +1036,21 @@ function promptMatchesContent(prompt: string, content: string): boolean {
   //   <command-message>work-on-task</command-message>
   //   <command-name>/work-on-task</command-name>
   //   <command-args><id>\n\nTask: ...</command-args>
-  // Exact equality misses this. The args body is exactly the tail of the
-  // original prompt (everything after `/<name> `), so recovering the match is
-  // a single endsWith check.
-  const match = content.match(/<command-args>([\s\S]*)<\/command-args>$/);
-  if (!match) return false;
-  const args = match[1] ?? "";
-  return args.length > 0 && prompt.endsWith(args);
+  // Anchor on the command name at the prompt's start and the args body at the
+  // prompt's end; require the gap between them to be whitespace-only. This
+  // stays robust to whatever Claude does with the separator (single space,
+  // multiple spaces, newlines) and handles no-arg commands (where matching on
+  // args alone would degenerate to endsWith("") and match anything).
+  const nameMatch = content.match(/<command-name>(\/[a-z0-9:-]+)<\/command-name>/);
+  if (!nameMatch) return false;
+  const name = nameMatch[1];
+  if (!prompt.startsWith(name)) return false;
+  const argsMatch = content.match(/<command-args>([\s\S]*?)<\/command-args>/);
+  const args = argsMatch?.[1] ?? "";
+  if (args === "") return prompt.slice(name.length).trim() === "";
+  if (!prompt.endsWith(args)) return false;
+  const gap = prompt.slice(name.length, prompt.length - args.length);
+  return /^\s*$/.test(gap);
 }
 
 async function waitForPrompt(tmuxSession: string) {
