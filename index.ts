@@ -1019,10 +1019,38 @@ export function rowContainsPromptAfter(
   promptSentAt: number,
   allowMissingTimestamp = false,
 ) {
-  if (row.type !== "user" || row.message?.content !== prompt) return false;
+  if (row.type !== "user") return false;
+  const content = row.message?.content;
+  if (typeof content !== "string") return false;
+  if (!promptMatchesContent(prompt, content)) return false;
   if (typeof row.timestamp !== "string") return allowMissingTimestamp;
   const timestamp = Date.parse(row.timestamp);
   return Number.isFinite(timestamp) && timestamp >= promptSentAt - 1_000;
+}
+
+function promptMatchesContent(prompt: string, content: string): boolean {
+  // Plain prompts arrive verbatim in the transcript.
+  if (content === prompt) return true;
+  // Claude rewrites slash-command prompts into a structured envelope before
+  // logging them, e.g. a prompt of `/work-on-task <id>\n\nTask: ...` becomes:
+  //   <command-message>work-on-task</command-message>
+  //   <command-name>/work-on-task</command-name>
+  //   <command-args><id>\n\nTask: ...</command-args>
+  // Anchor on the command name at the prompt's start and the args body at the
+  // prompt's end; require the gap between them to be whitespace-only. This
+  // stays robust to whatever Claude does with the separator (single space,
+  // multiple spaces, newlines) and handles no-arg commands (where matching on
+  // args alone would degenerate to endsWith("") and match anything).
+  const nameMatch = content.match(/<command-name>(\/[a-z0-9:-]+)<\/command-name>/);
+  if (!nameMatch) return false;
+  const name = nameMatch[1];
+  if (!prompt.startsWith(name)) return false;
+  const argsMatch = content.match(/<command-args>([\s\S]*?)<\/command-args>/);
+  const args = argsMatch?.[1] ?? "";
+  if (args === "") return prompt.slice(name.length).trim() === "";
+  if (!prompt.endsWith(args)) return false;
+  const gap = prompt.slice(name.length, prompt.length - args.length);
+  return /^\s*$/.test(gap);
 }
 
 async function waitForPrompt(tmuxSession: string) {
