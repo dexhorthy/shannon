@@ -1019,10 +1019,30 @@ export function rowContainsPromptAfter(
   promptSentAt: number,
   allowMissingTimestamp = false,
 ) {
-  if (row.type !== "user" || row.message?.content !== prompt) return false;
+  if (row.type !== "user") return false;
+  const content = row.message?.content;
+  if (typeof content !== "string") return false;
+  if (!promptMatchesContent(prompt, content)) return false;
   if (typeof row.timestamp !== "string") return allowMissingTimestamp;
   const timestamp = Date.parse(row.timestamp);
   return Number.isFinite(timestamp) && timestamp >= promptSentAt - 1_000;
+}
+
+function promptMatchesContent(prompt: string, content: string): boolean {
+  // Plain prompts arrive verbatim in the transcript.
+  if (content === prompt) return true;
+  // Claude rewrites slash-command prompts into a structured envelope before
+  // logging them, e.g. a prompt of `/work-on-task <id>\n\nTask: ...` becomes:
+  //   <command-message>work-on-task</command-message>
+  //   <command-name>/work-on-task</command-name>
+  //   <command-args><id>\n\nTask: ...</command-args>
+  // Exact equality misses this. The args body is exactly the tail of the
+  // original prompt (everything after `/<name> `), so recovering the match is
+  // a single endsWith check.
+  const match = content.match(/<command-args>([\s\S]*)<\/command-args>$/);
+  if (!match) return false;
+  const args = match[1] ?? "";
+  return args.length > 0 && prompt.endsWith(args);
 }
 
 async function waitForPrompt(tmuxSession: string) {

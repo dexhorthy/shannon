@@ -224,6 +224,54 @@ test("matches resumed transcript prompts by timestamp", () => {
   ).toBe(true);
 });
 
+test("matches slash-command prompts that Claude rewrote into a command envelope", () => {
+  // Claude wraps slash-command prompts before logging them to the transcript:
+  //   prompt:  "/work-on-task 23613387...\n\nTask: \"hello\"..."
+  //   content: "<command-message>work-on-task</command-message>" +
+  //            "<command-name>/work-on-task</command-name>" +
+  //            "<command-args>23613387...\n\nTask: \"hello\"...</command-args>"
+  // Without a fallback, exact-equality fails and waitForSessionWithPrompt
+  // times out for every slash-command-driven session.
+  const promptSentAt = Date.parse("2026-05-23T20:27:08.000Z");
+  const args = "23613387-7072-48ac-a8a0-5ebb7008e783\n\nTask: \"hello\"";
+  const prompt = `/work-on-task ${args}`;
+  const content =
+    "<command-message>work-on-task</command-message>" +
+    "<command-name>/work-on-task</command-name>" +
+    `<command-args>${args}</command-args>`;
+
+  expect(
+    rowContainsPromptAfter(
+      {
+        type: "user",
+        timestamp: "2026-05-23T20:27:08.939Z",
+        message: { role: "user", content },
+      },
+      prompt,
+      promptSentAt,
+    ),
+  ).toBe(true);
+
+  // Envelope with mismatched args (different task body) must NOT match.
+  expect(
+    rowContainsPromptAfter(
+      {
+        type: "user",
+        timestamp: "2026-05-23T20:27:08.939Z",
+        message: {
+          role: "user",
+          content:
+            "<command-message>work-on-task</command-message>" +
+            "<command-name>/work-on-task</command-name>" +
+            "<command-args>different-id\n\nTask: \"other\"</command-args>",
+        },
+      },
+      prompt,
+      promptSentAt,
+    ),
+  ).toBe(false);
+});
+
 test("extracts text from Anthropic content blocks", () => {
   expect(textFromContent([{ type: "text", text: "hello" }, { type: "tool_use" }])).toBe(
     "hello",
