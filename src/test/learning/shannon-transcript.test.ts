@@ -115,6 +115,28 @@ test("forwards additional Claude interactive session flags", () => {
   ]);
 });
 
+test("forwards the file-variant system-prompt flags so large prompts skip argv", () => {
+  // Large system prompts overflow tmux's `new-session ... cmd <argv>`
+  // command-length cap (~16 KB) when inlined via `--append-system-prompt
+  // <huge-string>` — tmux refuses with `command too long`. Claude exposes
+  // `--system-prompt-file` / `--append-system-prompt-file` for exactly this
+  // case; shannon now passes them through so callers can route around the cap.
+  expect(
+    parseArgs([
+      "hello",
+      "--system-prompt-file",
+      "/tmp/system.md",
+      "--append-system-prompt-file",
+      "/tmp/append.md",
+    ]).claudeArgs,
+  ).toEqual([
+    "--append-system-prompt-file",
+    "/tmp/append.md",
+    "--system-prompt-file",
+    "/tmp/system.md",
+  ]);
+});
+
 test("accepts Claude print output formats", () => {
   expect(parseArgs(["-p", "hello", "--output-format=json"]).outputFormat).toBe("json");
   expect(parseArgs(["-p", "hello", "--output-format=text"]).outputFormat).toBe("text");

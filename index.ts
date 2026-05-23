@@ -152,6 +152,7 @@ export function parseArgs(argv: string[], cwd = process.cwd()): CliOptions {
     .option("--allow-dangerously-skip-permissions", "enable bypassing all permission checks as an option")
     .option("--allowedTools, --allowed-tools <tools...>", "tool names to allow")
     .option("--append-system-prompt <prompt>", "append to the default system prompt")
+    .option("--append-system-prompt-file <path>", "append to the default system prompt, read from a file")
     .option("--bare", "minimal Claude mode")
     .option("--betas <betas...>", "beta headers to include")
     .option("--brief", "enable SendUserMessage tool")
@@ -192,6 +193,7 @@ export function parseArgs(argv: string[], cwd = process.cwd()): CliOptions {
     .option("--settings <file-or-json>", "settings file or JSON")
     .option("--strict-mcp-config", "strict MCP config")
     .option("--system-prompt <prompt>", "system prompt")
+    .option("--system-prompt-file <path>", "system prompt read from a file")
     .option("--tools <tools...>", "available tools")
     .option("--tmux [mode]", "create a tmux session for the worktree")
     .option("-w, --worktree [name]", "create a new git worktree for this session")
@@ -270,6 +272,7 @@ export function buildClaudeArgs(parsed: Record<string, unknown>): string[] {
   addBoolean(args, "--allow-dangerously-skip-permissions", parsed.allowDangerouslySkipPermissions);
   addRepeated(args, "--allowed-tools", parsed.allowedTools);
   addString(args, "--append-system-prompt", parsed.appendSystemPrompt);
+  addString(args, "--append-system-prompt-file", parsed.appendSystemPromptFile);
   addBoolean(args, "--bare", parsed.bare);
   addRepeated(args, "--betas", parsed.betas);
   addBoolean(args, "--brief", parsed.brief);
@@ -307,6 +310,7 @@ export function buildClaudeArgs(parsed: Record<string, unknown>): string[] {
   addString(args, "--settings", parsed.settings);
   addBoolean(args, "--strict-mcp-config", parsed.strictMcpConfig);
   addString(args, "--system-prompt", parsed.systemPrompt);
+  addString(args, "--system-prompt-file", parsed.systemPromptFile);
   addRepeated(args, "--tools", parsed.tools);
   addOptionalString(args, "--tmux", parsed.tmux);
   addOptionalString(args, "--worktree", parsed.worktree);
